@@ -1,0 +1,5 @@
+{
+  "name": "app-1.0.1.tar.gz",
+  "payload": "tampered-payload",
+  "sha256": "deadbeef"
+}
