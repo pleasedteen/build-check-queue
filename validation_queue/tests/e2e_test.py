@@ -7,7 +7,11 @@
      过期租约交回的旧结果（同一任务只执行出一份结果）；
   3. 收件端名额：满额时暂停该端首次领取，其他收件端与到期换手不受影响；
   4. 服务故障恢复：收件服务停机期间结果在队列持久保留，恢复后自动续投，
-     队列重启与收件端重启后均不丢结果、不重复执行校验。
+     队列重启与收件端重启后均不丢结果、不重复执行校验；
+  5. 投递并发与限时：全局并发=2、单次限时=1s，6 个收件端持续挂起/零星
+     返回数据时，挂起尝试仍占并发名额，但不阻塞在线端（结果就绪起 6 秒内
+     收妥）；故障端恢复后自动续投，每任务只留一份结果、名额释放、已接受
+     的校验不重跑。
 
 直接运行：
     python3 -I tests/e2e_test.py
@@ -20,9 +24,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -152,6 +158,93 @@ def make_artifact(tmp: Path, fname: str, payload: str,
     return path
 
 
+class FaultyInbox:
+    """测试内收件端：可模拟“持续挂起”“零星返回数据”，也可恢复为正常收妥。
+
+    - hang：读完请求后长时间不响应，客户端只能在整次限时后放弃；
+    - trickle：发出响应头后每隔 0.2s 才吐一个字节，制造慢速零星返回；
+    - ok：正常幂等收妥，按 task_id 去重并记录重复次数。
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.mode = "hang"
+        self.counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def _read_body(self) -> dict:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    data = json.loads(raw or b"{}")
+                    return data if isinstance(data, dict) else {}
+                except ValueError:
+                    return {}
+
+            def do_POST(self):
+                payload = self._read_body()
+                mode = outer.mode
+                if mode == "hang":
+                    time.sleep(30)  # 持续挂起，直到客户端限时放弃
+                    return
+                if mode == "trickle":
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", "100000")
+                        self.end_headers()
+                        for _ in range(60):
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                            time.sleep(0.2)
+                    except OSError:
+                        pass
+                    return
+                task_id = payload.get("task_id")
+                with outer._lock:
+                    outer.counts[task_id] = outer.counts.get(task_id, 0) + 1
+                    count = outer.counts[task_id]
+                body = json.dumps({"ok": True, "task_id": task_id,
+                                   "duplicated": count > 1}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                body = json.dumps({"ok": True, "recipient": outer.name}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.server.block_on_close = False
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                        daemon=True)
+        self.thread.start()
+
+    def result_count(self, task_id: str) -> int:
+        with self._lock:
+            return self.counts.get(task_id, 0)
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
 class Harness:
     def __init__(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vq-e2e-"))
@@ -168,6 +261,7 @@ class Harness:
         self.beta_url = f"http://127.0.0.1:{self.beta_port}"
         self.gamma_url = f"http://127.0.0.1:{self.gamma_port}"
         self.procs: list[Process] = []
+        self.faulty_inboxes: list[FaultyInbox] = []
         self.validator = str(VQ / "samples" / "sample_validator.py")
         self.run_log = str(self.tmp / "validator_runs.log")
         self.good = make_artifact(self.tmp, "good.json", "normal-artifact")
@@ -175,12 +269,18 @@ class Harness:
                                  corrupt_checksum=True)
 
     # --- 进程启动 ---
-    def start_queue(self):
-        p = Process("queue", [
+    def start_queue(self, concurrency: int | None = None,
+                    request_timeout: float | None = None):
+        cmd = [
             PYTHON, "-I", str(VQ / "queue_server.py"),
             "--port", str(self.qport), "--db", str(self.qdb),
             "--lease-ttl", str(LEASE_TTL),
-            "--delivery-interval", str(DELIVERY_INTERVAL)])
+            "--delivery-interval", str(DELIVERY_INTERVAL)]
+        if concurrency is not None:
+            cmd += ["--delivery-concurrency", str(concurrency)]
+        if request_timeout is not None:
+            cmd += ["--delivery-timeout", str(request_timeout)]
+        p = Process("queue", cmd)
         self.procs.append(p)
         wait_http(self.queue_url + "/health", "队列")
         return p
@@ -228,6 +328,10 @@ class Harness:
         _, body = http(url + "/results")
         return body["results"]
 
+    def delivery_stats(self) -> dict:
+        _, body = http(self.queue_url + "/health")
+        return body.get("delivery") or {}
+
     def validator_run_count(self, tid: str) -> int:
         if not Path(self.run_log).exists():
             return 0
@@ -245,6 +349,8 @@ class Harness:
     def teardown(self):
         for p in list(self.procs):
             p.stop()
+        for inbox in getattr(self, "faulty_inboxes", []):
+            inbox.stop()
         log(f"临时目录保留在: {self.tmp}")
 
 
@@ -426,6 +532,68 @@ def main() -> int:
         t6 = h.submit("alpha", h.good)
         wait_until("名额释放后新任务可正常领取送达",
                    lambda: delivered(t6), timeout=15)
+
+        # ========== 7. 投递并发上限 + 整次限时：故障端不阻塞在线端 ==========
+        log("== 场景 7：并发=2、单次限时=1s，6 个故障端挂起/零星返回，"
+            "在线端仍在 6s 内收妥 ==")
+        h.stop_named("queue")
+        time.sleep(0.6)
+        h.start_queue(concurrency=2, request_timeout=1.0)
+
+        # 6 个故障端：3 个持续挂起，3 个零星返回数据；均已注册且有较早任务
+        faulty: list[tuple[str, FaultyInbox, str]] = []
+        for i in range(6):
+            name = f"fault-{i}"
+            inbox = FaultyInbox(name)
+            inbox.mode = "hang" if i % 2 == 0 else "trickle"
+            h.faulty_inboxes.append(inbox)
+            h.register(name, inbox.url, cap=5)
+            faulty.append((name, inbox, h.submit(name, h.good)))
+        wait_until("6 个故障端的结果都已完成校验等待投递（较早的待投结果）",
+                   lambda: all(h.task(tid)["state"] == "succeeded"
+                               for _, _, tid in faulty), timeout=20)
+        # 让调度器在故障端上转几轮：挂起/零星返回的尝试确实占着名额
+        wait_until("挂起/超时尝试用满并发名额（max_active=2）",
+                   lambda: h.delivery_stats().get("max_active") == 2, timeout=10)
+        stats = h.delivery_stats()
+        check("全局并发不超过配置的 2（挂起尝试同样占名额，但上限有效）",
+              stats["max_active"] == 2, str(stats))
+
+        # 在线端（真实 alpha 收件服务）提交一个更晚的任务
+        online = h.submit("alpha", h.good)
+        wait_until("在线任务完成校验（结果就绪）",
+                   lambda: h.task(online)["state"] == "succeeded", timeout=15)
+        ready_at = time.time()
+        wait_until("在线端在故障端积压期间收妥",
+                   lambda: delivered(online), timeout=8)
+        elapsed = time.time() - ready_at
+        check(f"在线端从结果就绪起 {elapsed:.2f}s 内收妥（要求 <= 6s）",
+              elapsed <= 6.0, f"elapsed={elapsed:.2f}s")
+        check("在线端收妥时 6 个故障端仍各有待投结果（积压未阻塞他人）",
+              all(h.task(tid)["state"] == "succeeded"
+                  for _, _, tid in faulty))
+        check("在线任务校验只执行一次（已接受结果不重跑）",
+              h.validator_run_count(online) == 1)
+
+        # 故障端恢复：自动续投，每任务只留一份结果，收妥后释放名额
+        log("  故障端恢复为正常收妥，等待自动续投……")
+        for _, inbox, _ in faulty:
+            inbox.mode = "ok"
+        wait_until("6 个故障端的积压自动续投收妥",
+                   lambda: all(h.task(tid)["state"] == "delivered"
+                               for _, _, tid in faulty), timeout=15)
+        check("每个故障任务在对应收件端恰收妥一次（每任务只留一份结果）",
+              all(inbox.result_count(tid) == 1 for _, inbox, tid in faulty),
+              str([(n, inbox.result_count(tid)) for n, inbox, tid in faulty]))
+        check("故障端任务校验均只执行一次（已接受校验无需重跑）",
+              all(h.validator_run_count(tid) == 1 for _, _, tid in faulty))
+        _, recs = http(h.queue_url + "/recipients")
+        check("故障端收妥后名额全部释放（inflight=0）",
+              all(r["inflight"] == 0 for r in recs["recipients"]
+                  if r["id"].startswith("fault-")),
+              str(recs["recipients"]))
+        check("恢复后全局并发仍不超过 2", h.delivery_stats()["max_active"] <= 2,
+              str(h.delivery_stats()))
 
     except AssertionError as exc:
         failed += 1

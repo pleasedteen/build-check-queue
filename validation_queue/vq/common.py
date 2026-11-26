@@ -4,15 +4,16 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
+import socket
 import sqlite3
+import threading
 import time
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from http.server import HTTPServer
+from urllib.parse import urlsplit
 
 
 def now_ms() -> int:
@@ -61,27 +62,103 @@ class HttpError(Exception):
 
 def http_request(url: str, payload: dict | None = None, method: str = "GET",
                  timeout: float = 10.0):
-    """发起 JSON HTTP 请求，返回解析后的 JSON（无响应体时返回 None）。"""
+    """发起 JSON HTTP 请求，返回解析后的 JSON（无响应体时返回 None）。
+
+    ``timeout`` 是整次请求（连接 + 发送 + 等待响应 + 读完响应体）的硬上限，
+    而不是单次 socket 操作的超时。为避免服务端慢速零星返回数据时读超时被
+    不断重置、请求无限拖长，这里叠加一层看门狗：到点直接 shutdown 套接字，
+    阻塞中的读写立即失败。
+    """
     data = None
     headers = {"Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"非法 URL: {url}")
+    deadline = time.monotonic() + timeout
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+
+    if parts.scheme == "https":
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port,
+                                           timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(parts.hostname, parts.port,
+                                          timeout=timeout)
+    expired = threading.Event()
+
+    def _watchdog() -> None:
+        # 到点未结束：标记超时并断开套接字，解除阻塞的 connect/send/recv
+        expired.set()
+        sock = conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    timer = threading.Timer(timeout, _watchdog)
+    timer.daemon = True
+    timer.start()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read()
-            if not body:
-                return None
-            return json.loads(body.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(detail)
-            detail = parsed.get("error", detail)
-        except (ValueError, TypeError):
-            pass
-        raise HttpError(exc.code, detail) from None
+        conn.request(method, path, body=data, headers=headers)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("等待响应超过整次请求时限")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        resp = conn.getresponse()
+        body = _read_body_with_deadline(conn, resp, deadline)
+        # 看门狗到点关闭套接字后，读取可能表现为连接断开/空响应：
+        # 必须按超时失败处理，绝不能被当成“收妥成功”。
+        if expired.is_set():
+            raise TimeoutError("整次请求超过时限")
+        if resp.status >= 400:
+            detail = body.decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(detail)
+                detail = parsed.get("error", detail)
+            except (ValueError, TypeError):
+                pass
+            raise HttpError(resp.status, detail)
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+    except (TimeoutError, OSError) as exc:
+        if expired.is_set() or isinstance(exc, TimeoutError):
+            raise HttpError(504, f"请求超时（>{timeout:.1f}s）: {url}") from None
+        raise
+    finally:
+        timer.cancel()
+        conn.close()
+
+
+def _read_body_with_deadline(conn, resp, deadline: float) -> bytes:
+    """在整次请求的截止时间前读完响应体；超时按失败处理。
+
+    每次读之前把 socket 超时收紧到“剩余时间”，服务端零星返回数据时不会
+    因为每次 read 都重置超时而无限拖长。
+    """
+    chunks: list[bytes] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("响应体读取超过整次请求时限")
+        if conn.sock is not None:
+            conn.sock.settimeout(remaining)
+        # read1 有多少返回多少，不会为凑满缓冲区而一直等待：
+        # 服务端零星/缓慢返回数据时也能在下一轮检查截止时间并及时结束。
+        chunk = resp.read1(65536)
+        if not chunk:
+            if not resp.isclosed() and resp.length:
+                # 响应体还没读完就读到 EOF：连接被中断，按失败处理
+                raise TimeoutError("响应体未读完连接即中断")
+            return b"".join(chunks)
+        chunks.append(chunk)
 
 
 class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):

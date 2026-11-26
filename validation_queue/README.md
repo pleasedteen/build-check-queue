@@ -36,6 +36,13 @@
   仅暂停该端任务的**首次领取**；新任务提交、到期换手、其他收件端均不受影响。
 - **收件端幂等**：同一 `task_id` 在收件端只保留一份结果，重复投递只累加
   `duplicate_count`。
+- **投递并发与限时**：后台投递可配置全局并发上限（`--delivery-concurrency`，
+  默认 4）与单次请求整次限时（`--delivery-timeout`，默认 5s）。一次投递
+  尝试从发起到真正结束都占用并发名额，**挂起或超时但尚未结束的尝试同样
+  占用名额**；限时覆盖连接、等待响应与读完响应体全过程，服务端慢速零星
+  返回数据也会在限时内结束。同一收件端同时最多一次投递，多个收件端之间
+  按轮转挑选，因此**单个故障端的积压不会占满并发、阻塞其他收件端**。当前
+  并发占用可在 `GET /health` 的 `delivery` 字段查看。
 
 ## 目录结构
 
@@ -43,7 +50,7 @@
 validation_queue/
 ├── vq/
 │   ├── common.py                 # SQLite/HTTP 公共工具
-│   ├── queue_server.py           # 队列服务（租约、名额、投递循环）
+│   ├── queue_server.py           # 队列服务（租约、名额、并发投递）
 │   ├── inbox_server.py           # 项目收件服务（独立 SQLite）
 │   ├── worker.py                 # 工作进程（多实例可并行）
 │   ├── client.py                 # 命令行客户端
@@ -66,9 +73,10 @@ validation_queue/
 cd validation_queue
 mkdir -p data
 
-# 1) 队列服务（租约 10 秒，投递轮询 0.5 秒）
+# 1) 队列服务（租约 10 秒，投递轮询 0.5 秒，并发上限 2，单次限时 1 秒）
 python3 -I vq/queue_server.py --port 8080 --db data/queue.db \
-    --lease-ttl 10 --delivery-interval 0.5
+    --lease-ttl 10 --delivery-interval 0.5 \
+    --delivery-concurrency 2 --delivery-timeout 1
 
 # 2) 两个项目各自的收件服务（各自独立数据库）
 python3 -I vq/inbox_server.py --id alpha --port 9001 --db data/alpha.db
@@ -121,7 +129,9 @@ python3 -I vq/queue_server.py --port 8080 --db data/queue.db --lease-ttl 10
 
 一条命令自动拉起队列、3 个收件服务和多个工作进程，覆盖正常流程、租约
 换手（含过期租约 409 拒绝）、名额满额隔离、收件端/队列重启恢复与幂等
-去重，约 30~50 秒输出可读结果（要求 80 秒内）：
+去重，以及投递并发与限时（并发=2、单次限时=1s 时 6 个故障端持续挂起/
+零星返回，在线端仍在结果就绪起 6 秒内收妥），约 30~50 秒输出可读结果
+（要求 80 秒内）：
 
 ```bash
 python3 -I tests/e2e_test.py
@@ -141,5 +151,6 @@ python3 -I tests/e2e_test.py
 | GET  | `/tasks` / `/task?id=` | 任务列表 / 单任务进度 |
 | POST | `/lease` | 工作进程领取任务（返回 `lease_token` 与到期时间） |
 | POST | `/tasks/<id>/complete` | 凭 `lease_token` 交回结果，过期/重复返回 409 |
+| GET  | `/health` | 健康检查；含 `delivery` 投递并发占用（`active`/`max_active`） |
 | POST | 收件端 `/results` | 队列投递结果；收件端按 `task_id` 幂等去重 |
 | GET  | 收件端 `/results[?task_id=]` | 在收件端查询结果 |

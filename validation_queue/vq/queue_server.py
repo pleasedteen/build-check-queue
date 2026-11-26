@@ -6,7 +6,10 @@
 - 只接受持有当前有效租约的进程交回的结果；
 - 后台把已完成结果持续投递到对应收件服务，停机恢复后自动续投；
 - 按收件端配置“未收妥任务数上限”，满额时暂停该端任务的 *首次领取*
-  （到期换手不受额度限制，提交也始终可用）。
+  （到期换手不受额度限制，提交也始终可用）；
+- 投递并发受全局上限约束，每次请求有整次限时；挂起/超时但尚未结束的
+  尝试仍占并发名额。同一收件端同时最多一次投递，保证单个故障端的积压
+  不会占满并发、阻塞其他收件端。
 
 进程崩溃后数据仍在 SQLite 中，重启即可继续，已完成任务不会重新执行。
 """
@@ -17,8 +20,8 @@ import json
 import sqlite3
 import sys
 import threading
-import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -97,19 +100,22 @@ class QueueStore:
         return self.get_recipient(recipient_id)
 
     def get_recipient(self, recipient_id: str) -> dict:
-        row = self.conn.execute(
-            "SELECT * FROM recipients WHERE id=?", (recipient_id,)).fetchone()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM recipients WHERE id=?", (recipient_id,)).fetchone()
         if row is None:
             raise HttpError(404, f"未知收件端: {recipient_id}")
         return dict(row)
 
     def list_recipients(self) -> list[dict]:
-        rows = self.conn.execute("SELECT * FROM recipients ORDER BY id").fetchall()
-        out = []
-        for row in rows:
-            item = dict(row)
-            item["inflight"] = self._inflight(item["id"])
-            out.append(item)
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM recipients ORDER BY id").fetchall()
+            out = []
+            for row in rows:
+                item = dict(row)
+                item["inflight"] = self._inflight(item["id"])
+                out.append(item)
         return out
 
     def _inflight(self, recipient: str) -> int:
@@ -135,20 +141,22 @@ class QueueStore:
         return self.get_task(task_id)
 
     def get_task(self, task_id: str) -> dict:
-        row = self.conn.execute("SELECT * FROM tasks WHERE id=?",
-                                (task_id,)).fetchone()
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM tasks WHERE id=?",
+                                    (task_id,)).fetchone()
         if row is None:
             raise HttpError(404, f"未知任务: {task_id}")
         return self._task_dict(row)
 
     def list_tasks(self, recipient: str | None = None) -> list[dict]:
-        if recipient:
-            rows = self.conn.execute(
-                "SELECT * FROM tasks WHERE recipient=? ORDER BY created_at",
-                (recipient,)).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM tasks ORDER BY created_at").fetchall()
+        with self.lock:
+            if recipient:
+                rows = self.conn.execute(
+                    "SELECT * FROM tasks WHERE recipient=? ORDER BY created_at",
+                    (recipient,)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM tasks ORDER BY created_at").fetchall()
         return [self._task_dict(r) for r in rows]
 
     def _task_dict(self, row: sqlite3.Row) -> dict:
@@ -253,9 +261,10 @@ class QueueStore:
 
     # ---------- 投递 ----------
     def deliverable_tasks(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM tasks WHERE state='succeeded' ORDER BY completed_at"
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM tasks WHERE state='succeeded' ORDER BY completed_at"
+            ).fetchall()
 
     def mark_delivery_attempt(self, task_id: str, error: str | None) -> None:
         with self.lock:
@@ -284,7 +293,8 @@ def _query_param(req, name: str) -> str:
     raise HttpError(400, f"缺少查询参数 {name}")
 
 
-def make_routes(store: QueueStore, lease_ttl_ms: int) -> dict:
+def make_routes(store: QueueStore, lease_ttl_ms: int,
+                delivery_stats=None) -> dict:
     def register(payload, _req):
         recipient = payload.get("id")
         base_url = payload.get("base_url")
@@ -327,7 +337,10 @@ def make_routes(store: QueueStore, lease_ttl_ms: int) -> dict:
         return 200, {"task": store.lease(worker_id, lease_ttl_ms)}
 
     def health(_payload, _req):
-        return 200, {"ok": True, "time": now_ms()}
+        body = {"ok": True, "time": now_ms()}
+        if delivery_stats is not None:
+            body["delivery"] = delivery_stats()
+        return 200, body
 
     return {
         ("POST", "/recipients"): register,
@@ -362,33 +375,131 @@ class _RoutedHandler(Handler):
         super()._handle(method)
 
 
-def delivery_loop(store: QueueStore, stop_event: threading.Event,
-                  interval: float) -> None:
-    """后台投递线程：收件服务恢复后自动续投，无需新提交触发。"""
-    while not stop_event.is_set():
+class DeliveryEngine:
+    """后台投递调度器。
+
+    - 全局同时进行的投递尝试不超过 ``concurrency`` 个（信号量名额）；一次
+      尝试从发起到真正结束（含挂起/超时）都占着名额，只有线程返回才释放。
+    - 每次 HTTP 请求受 ``request_timeout`` 整次限时约束（连接、等待响应、
+      读取响应体合计），慢速零星返回数据也会在时限内结束。
+    - 同一收件端同时只允许一次投递：单个故障端的积压最多占一个名额，
+      不会把全局并发占满而阻塞其他收件端。
+    - 有多个收件端待投时按收件端轮转（round-robin）挑选，保证在线端不会
+      被故障端的长期积压饿死。
+    """
+
+    def __init__(self, store: QueueStore, stop_event: threading.Event,
+                 interval: float, concurrency: int, request_timeout: float):
+        self.store = store
+        self.stop_event = stop_event
+        self.interval = interval
+        self.request_timeout = request_timeout
+        self._slots = threading.BoundedSemaphore(concurrency)
+        self._cond = threading.Condition()
+        self._inflight_recipients: set[str] = set()
+        self._cursor = 0
+        self.concurrency = concurrency
+        self._stats_lock = threading.Lock()
+        self._active = 0
+        self._max_active = 0
+        self._executor = ThreadPoolExecutor(
+            max_workers=concurrency, thread_name_prefix="deliver")
+
+    def stats(self) -> dict:
+        """当前/历史最大并发投递尝试数，用于观测名额占用（含挂起未结束的）。"""
+        with self._stats_lock:
+            return {"concurrency": self.concurrency,
+                    "active": self._active,
+                    "max_active": self._max_active}
+
+    def start(self) -> threading.Thread:
+        thread = threading.Thread(target=self._run, name="delivery", daemon=True)
+        thread.start()
+        return thread
+
+    # ---------- 调度 ----------
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            # 先拿一个全局并发名额；名额耗尽时等待而非展开新请求
+            while not self._slots.acquire(timeout=0.2):
+                if self.stop_event.is_set():
+                    return
+            if self.stop_event.is_set():
+                self._slots.release()
+                return
+            row, recipient_id = self._pick()
+            if row is None:
+                self._slots.release()
+                self.stop_event.wait(self.interval)
+                continue
+            try:
+                self._executor.submit(self._attempt, row, recipient_id)
+            except Exception:
+                LOG.exception("提交投递任务失败")
+                self._release_recipient(recipient_id)
+                self._slots.release()
+
+    def _pick(self):
+        """按收件端轮转挑选下一个待投任务；返回 (row, recipient_id)。"""
+        rows = self.store.deliverable_tasks()
+        if not rows:
+            return None, None
+        by_recipient: dict[str, list] = {}
+        for row in rows:  # deliverable_tasks 已按 completed_at 升序
+            by_recipient.setdefault(row["recipient"], []).append(row)
+        ids = sorted(by_recipient)
+        with self._cond:
+            for offset in range(len(ids)):
+                index = (self._cursor + offset) % len(ids)
+                rid = ids[index]
+                if rid in self._inflight_recipients:
+                    continue  # 该端已有一次投递在途，交给其他端
+                self._cursor = (index + 1) % len(ids)
+                self._inflight_recipients.add(rid)
+                return by_recipient[rid][0], rid
+        return None, None
+
+    def _release_recipient(self, recipient_id: str) -> None:
+        with self._cond:
+            self._inflight_recipients.discard(recipient_id)
+            self._cond.notify_all()
+
+    # ---------- 单次尝试 ----------
+    def _attempt(self, row, recipient_id: str) -> None:
+        with self._stats_lock:
+            self._active += 1
+            self._max_active = max(self._max_active, self._active)
         try:
-            for row in store.deliverable_tasks():
-                if stop_event.is_set():
-                    break
-                recipient = store.get_recipient(row["recipient"])
-                url = recipient["base_url"] + "/results"
-                try:
-                    result = json.loads(row["result"]) if row["result"] else None
-                    http_request(url, {
-                        "task_id": row["id"],
-                        "recipient": row["recipient"],
-                        "artifact": row["artifact"],
-                        "result": result,
-                    }, method="POST", timeout=5)
-                    store.mark_delivered(row["id"])
-                    LOG.info("任务 %s 已投递并由收件端 %s 收妥",
-                             row["id"], row["recipient"])
-                except Exception as exc:  # 收件端停机等任何失败：稍后重试
-                    store.mark_delivery_attempt(row["id"], str(exc)[:300])
-                    LOG.warning("任务 %s 投递失败（将重试）: %s", row["id"], exc)
+            self._deliver(row, recipient_id)
         except Exception:
-            LOG.exception("投递循环异常")
-        stop_event.wait(interval)
+            LOG.exception("投递任务异常: %s", row["id"])
+        finally:
+            with self._stats_lock:
+                self._active -= 1
+            self._release_recipient(recipient_id)
+            self._slots.release()
+
+    def _deliver(self, row, recipient_id: str) -> None:
+        recipient = self.store.get_recipient(recipient_id)
+        url = recipient["base_url"] + "/results"
+        try:
+            result = json.loads(row["result"]) if row["result"] else None
+            http_request(url, {
+                "task_id": row["id"],
+                "recipient": row["recipient"],
+                "artifact": row["artifact"],
+                "result": result,
+            }, method="POST", timeout=self.request_timeout)
+            self.store.mark_delivered(row["id"])
+            LOG.info("任务 %s 已投递并由收件端 %s 收妥",
+                     row["id"], recipient_id)
+        except Exception as exc:  # 收件端停机/挂起/超时等：稍后重试
+            self.store.mark_delivery_attempt(row["id"], str(exc)[:300])
+            LOG.warning("任务 %s 投递失败（将重试）: %s", row["id"], exc)
+
+    def shutdown(self) -> None:
+        # 单次尝试受整次请求限时约束，等待其结束可避免在连接关闭后再写库
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main() -> None:
@@ -400,16 +511,23 @@ def main() -> None:
                         help="租约有效期（秒），到期后任务可被其他进程接手")
     parser.add_argument("--delivery-interval", type=float, default=0.5,
                         help="后台投递轮询间隔（秒）")
+    parser.add_argument("--delivery-concurrency", type=int, default=4,
+                        help="全局同时进行的投递尝试上限（默认 4）")
+    parser.add_argument("--delivery-timeout", type=float, default=5.0,
+                        help="单次投递请求的整次限时（秒），挂起/超时的尝试"
+                             "在结束前仍占并发名额")
     args = parser.parse_args()
+    if args.delivery_concurrency < 1:
+        parser.error("--delivery-concurrency 必须 >= 1")
+    if args.delivery_timeout <= 0:
+        parser.error("--delivery-timeout 必须 > 0")
 
     store = QueueStore(args.db)
-    routes = make_routes(store, int(args.lease_ttl * 1000))
     stop_event = threading.Event()
-    deliverer = threading.Thread(
-        target=delivery_loop,
-        args=(store, stop_event, args.delivery_interval),
-        name="delivery", daemon=True)
-    deliverer.start()
+    engine = DeliveryEngine(store, stop_event, args.delivery_interval,
+                            args.delivery_concurrency, args.delivery_timeout)
+    routes = make_routes(store, int(args.lease_ttl * 1000), engine.stats)
+    engine.start()
 
     httpd = _ThreadingHTTPServer((args.host, args.port), _RoutedHandler)
     httpd.routes = routes
@@ -423,6 +541,7 @@ def main() -> None:
         pass
     finally:
         stop_event.set()
+        engine.shutdown()
         httpd.shutdown()
         httpd.server_close()
         store.close()
